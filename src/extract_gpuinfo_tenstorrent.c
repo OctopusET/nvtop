@@ -53,7 +53,7 @@ static bool read_sysfs_long(const char *path, long *value) {
 }
 
 static bool find_hwmon_path(const char *pci_path, char *hwmon_path, size_t size) {
-  char hwmon_dir[TT_PATH_MAX];
+  char hwmon_dir[PATH_MAX];
   snprintf(hwmon_dir, sizeof(hwmon_dir), "%s/hwmon", pci_path);
 
   DIR *dir = opendir(hwmon_dir);
@@ -108,7 +108,7 @@ static bool gpuinfo_tenstorrent_get_device_handles(struct list_head *devices, un
   unsigned num_devices = 0;
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
-    if (strncmp(entry->d_name, TT_SYSFS_PREFIX, strlen(TT_SYSFS_PREFIX)) == 0)
+    if (strncmp(entry->d_name, TT_SYSFS_PREFIX, sizeof(TT_SYSFS_PREFIX) - 1) == 0)
       num_devices++;
   }
 
@@ -126,7 +126,7 @@ static bool gpuinfo_tenstorrent_get_device_handles(struct list_head *devices, un
   rewinddir(dir);
 
   while ((entry = readdir(dir)) != NULL) {
-    if (strncmp(entry->d_name, TT_SYSFS_PREFIX, strlen(TT_SYSFS_PREFIX)) != 0)
+    if (strncmp(entry->d_name, TT_SYSFS_PREFIX, sizeof(TT_SYSFS_PREFIX) - 1) != 0)
       continue;
     if (*count >= num_devices)
       break;
