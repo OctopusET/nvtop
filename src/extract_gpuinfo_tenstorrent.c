@@ -19,9 +19,12 @@
  *
  */
 
+#include "nvtop/common.h"
 #include "nvtop/extract_gpuinfo_common.h"
 
+#include <ctype.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +41,7 @@ struct gpu_info_tenstorrent {
   char pci_device_path[TT_PATH_MAX];   // /sys/devices/.../0000:XX:YY.Z
   char hwmon_path[TT_PATH_MAX];        // .../hwmon/hwmonN
   unsigned device_id;
+  unsigned ordinal; // device index N from tenstorrent!N, matches /dev/tenstorrent/N
 };
 
 static struct gpu_info_tenstorrent *tt_devices;
@@ -135,6 +139,9 @@ static bool gpuinfo_tenstorrent_get_device_handles(struct list_head *devices, un
 
     snprintf(dev->sysfs_device_path, sizeof(dev->sysfs_device_path),
              "%s/%s", TT_SYSFS_CLASS, entry->d_name);
+
+    // Parse ordinal from "tenstorrent!N"
+    dev->ordinal = (unsigned)atoi(entry->d_name + sizeof(TT_SYSFS_PREFIX) - 1);
 
     // Resolve PCI device path via "device" symlink
     char device_link[PATH_MAX];
@@ -270,8 +277,140 @@ static void gpuinfo_tenstorrent_refresh_dynamic_info(struct gpu_info *_gpu_info)
     SET_GPUINFO_DYNAMIC(dynamic_info, pcie_link_width, val);
 }
 
+static bool parse_tenstorrent_fdinfo(FILE *f, unsigned *device,
+                                     unsigned long long *dmabuf,
+                                     unsigned long long *pinned) {
+  char line[256];
+  bool found = false;
+
+  *device = 0;
+  *dmabuf = 0;
+  *pinned = 0;
+
+  static const char key_device[] = "tenstorrent-device:\t";
+  static const char key_dmabuf[] = "tenstorrent-memory-dmabuf:\t";
+  static const char key_pinned[] = "tenstorrent-memory-pinned:\t";
+
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, key_device, sizeof(key_device) - 1) == 0) {
+      *device = (unsigned)atoi(line + sizeof(key_device) - 1);
+      found = true;
+    } else if (strncmp(line, key_dmabuf, sizeof(key_dmabuf) - 1) == 0) {
+      *dmabuf = strtoull(line + sizeof(key_dmabuf) - 1, NULL, 10);
+    } else if (strncmp(line, key_pinned, sizeof(key_pinned) - 1) == 0) {
+      *pinned = strtoull(line + sizeof(key_pinned) - 1, NULL, 10);
+    }
+  }
+  return found;
+}
+
+// Find or allocate a process entry for the given pid
+static struct gpu_process *find_or_alloc_process(struct gpu_info *info, pid_t pid) {
+  for (unsigned i = 0; i < info->processes_count; i++) {
+    if (info->processes[i].pid == pid)
+      return &info->processes[i];
+  }
+  if (info->processes_count == info->processes_array_size) {
+    info->processes_array_size += COMMON_PROCESS_LINEAR_REALLOC_INC;
+    info->processes = reallocarray(info->processes, info->processes_array_size,
+                                   sizeof(*info->processes));
+    if (!info->processes)
+      return NULL;
+  }
+  unsigned idx = info->processes_count++;
+  memset(&info->processes[idx], 0, sizeof(*info->processes));
+  info->processes[idx].pid = pid;
+  info->processes[idx].type = gpu_process_compute;
+  return &info->processes[idx];
+}
+
 static void gpuinfo_tenstorrent_get_running_processes(struct gpu_info *_gpu_info) {
+  struct gpu_info_tenstorrent *tt = container_of(_gpu_info, struct gpu_info_tenstorrent, base);
   _gpu_info->processes_count = 0;
+
+  DIR *proc_dir = opendir("/proc");
+  if (!proc_dir)
+    return;
+
+  struct dirent *proc_dent;
+  while ((proc_dent = readdir(proc_dir)) != NULL) {
+    if (proc_dent->d_type != DT_DIR || !isdigit(proc_dent->d_name[0]))
+      continue;
+
+    pid_t pid = (pid_t)atoi(proc_dent->d_name);
+    if (!pid)
+      continue;
+
+    char fd_path[TT_PATH_MAX];
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
+    int fd_dir_fd = open(fd_path, O_RDONLY | O_DIRECTORY);
+    if (fd_dir_fd < 0)
+      continue;
+
+    char fdinfo_path[TT_PATH_MAX];
+    snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo", pid);
+    int fdinfo_dir_fd = open(fdinfo_path, O_RDONLY | O_DIRECTORY);
+    if (fdinfo_dir_fd < 0) {
+      close(fd_dir_fd);
+      continue;
+    }
+
+    DIR *fd_dir = fdopendir(fd_dir_fd);
+    if (!fd_dir) {
+      close(fd_dir_fd);
+      close(fdinfo_dir_fd);
+      continue;
+    }
+
+    struct dirent *fd_dent;
+    while ((fd_dent = readdir(fd_dir)) != NULL) {
+      if (!isdigit(fd_dent->d_name[0]))
+        continue;
+
+      // Check if this fd points to /dev/tenstorrent/
+      char link_target[TT_PATH_MAX];
+      ssize_t len = readlinkat(fd_dir_fd, fd_dent->d_name, link_target, sizeof(link_target) - 1);
+      if (len <= 0)
+        continue;
+      link_target[len] = '\0';
+
+      static const char dev_prefix[] = "/dev/tenstorrent/";
+      if (strncmp(link_target, dev_prefix, sizeof(dev_prefix) - 1) != 0)
+        continue;
+
+      // Read fdinfo for this fd
+      int fi_fd = openat(fdinfo_dir_fd, fd_dent->d_name, O_RDONLY);
+      if (fi_fd < 0)
+        continue;
+      FILE *fi = fdopen(fi_fd, "r");
+      if (!fi) {
+        close(fi_fd);
+        continue;
+      }
+
+      unsigned device;
+      unsigned long long dmabuf, pinned;
+      bool ok = parse_tenstorrent_fdinfo(fi, &device, &dmabuf, &pinned);
+      fclose(fi);
+
+      if (!ok || device != tt->ordinal)
+        continue;
+
+      struct gpu_process *proc = find_or_alloc_process(_gpu_info, pid);
+      if (!proc)
+        continue;
+
+      unsigned long long cur = 0;
+      if (GPUINFO_PROCESS_FIELD_VALID(proc, gpu_memory_usage))
+        cur = proc->gpu_memory_usage;
+      SET_GPUINFO_PROCESS(proc, gpu_memory_usage, cur + dmabuf + pinned);
+    }
+
+    closedir(fd_dir); // also closes fd_dir_fd
+    close(fdinfo_dir_fd);
+  }
+
+  closedir(proc_dir);
 }
 
 struct gpu_vendor gpu_vendor_tenstorrent = {
